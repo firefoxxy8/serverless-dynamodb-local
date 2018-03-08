@@ -22,7 +22,13 @@ class ServerlessDynamodbLocal {
                     },
                     seed: {
                         lifecycleEvents: ["seedHandler"],
-                        usage: "Seeds local DynamoDB tables with data"
+                        usage: "Seeds local DynamoDB tables with data",
+                        options: {
+                            online: {
+                                shortcut: "o",
+                                usage: "Will connect to the tables online to do an online seed run"
+                            }
+                        }
                     },
                     start: {
                         lifecycleEvents: ["startHandler"],
@@ -66,6 +72,11 @@ class ServerlessDynamodbLocal {
                             }
                         }
                     },
+                    noStart: {
+                      shortcut: "n",
+                      default: false,
+                      usage: "Do not start DynamoDB local (in case it is already running)",
+                    },
                     remove: {
                         lifecycleEvents: ["removeHandler"],
                         usage: "Removes local DynamoDB"
@@ -102,13 +113,31 @@ class ServerlessDynamodbLocal {
         return port;
     }
 
-    dynamodbOptions() {
-        const dynamoOptions = {
-            endpoint: `http://localhost:${this.port}`,
-            region: "localhost",
-            accessKeyId: "MOCK_ACCESS_KEY_ID",
-            secretAccessKey: "MOCK_SECRET_ACCESS_KEY"
-        };
+    get host() {
+        const config = this.config;
+        const host = _.get(config, "start.host", "localhost");
+        return host;
+    }
+
+    dynamodbOptions(options) {
+        let dynamoOptions = {};
+
+        if(options && options.online){
+            this.serverlessLog("Connecting to online tables...");
+            if (!options.region) { 
+                throw new Error("please specify the region");
+            }
+            dynamoOptions = {
+                region: options.region,
+            };
+        } else {
+            dynamoOptions = {
+                endpoint: `http://${this.host}:${this.port}`,
+                region: "localhost",
+                accessKeyId: "MOCK_ACCESS_KEY_ID",
+                secretAccessKey: "MOCK_SECRET_ACCESS_KEY"
+            };
+        }
 
         return {
             raw: new AWS.DynamoDB(dynamoOptions),
@@ -123,7 +152,8 @@ class ServerlessDynamodbLocal {
     }
 
     seedHandler() {
-        const documentClient = this.dynamodbOptions().doc;
+        const options = this.options; 
+        const documentClient = this.dynamodbOptions(options).doc;
         const seedSources = this.seedSources;
         return BbPromise.each(seedSources, (source) => {
             if (!source.table) {
@@ -152,22 +182,37 @@ class ServerlessDynamodbLocal {
             this.options
         );
 
-        dynamodbLocal.start(options);
+        // otherwise endHandler will be mis-informed
+        this.options = options;
+        if (!options.noStart) {
+          dynamodbLocal.start(options);
+        }
         return BbPromise.resolve()
         .then(() => options.migrate && this.migrateHandler())
         .then(() => options.seed && this.seedHandler());
     }
 
     endHandler() {
-        this.serverlessLog('DynamoDB - stopping local database');
-        dynamodbLocal.stop(this.port);
+        if (!this.options.noStart) {
+            this.serverlessLog("DynamoDB - stopping local database");
+            dynamodbLocal.stop(this.port);
+        }
     }
 
-    /**
-     * Gets the table definitions
-     */
-    get tables() {
-        const resources = this.service.resources.Resources;
+    getDefaultStack() {
+        return _.get(this.service, "resources");
+    }
+
+    getAdditionalStacks() {
+        return _.values(_.get(this.service, "custom.additionalStacks", {}));
+    }
+
+    hasAdditionalStacksPlugin() {
+        return _.get(this.service, "plugins", []).includes("serverless-plugin-additional-stacks");
+    }
+
+    getTableDefinitionsFromStack(stack) {
+        const resources = _.get(stack, "Resources", []);
         return Object.keys(resources).map((key) => {
             if (resources[key].Type === "AWS::DynamoDB::Table") {
                 return resources[key].Properties;
@@ -176,12 +221,30 @@ class ServerlessDynamodbLocal {
     }
 
     /**
+     * Gets the table definitions
+     */
+    get tables() {
+        let stacks = [];
+
+        const defaultStack = this.getDefaultStack();
+        if (defaultStack) {
+            stacks.push(defaultStack);
+        }
+
+        if (this.hasAdditionalStacksPlugin()) {
+            stacks = stacks.concat(this.getAdditionalStacks());
+        }
+
+        return stacks.map((stack) => this.getTableDefinitionsFromStack(stack)).reduce((tables, tablesInStack) => tables.concat(tablesInStack), []);
+    }
+
+    /**
      * Gets the seeding sources
      */
     get seedSources() {
         const config = this.service.custom.dynamodb;
         const seedConfig = _.get(config, "seed", {});
-        const seed = this.options.seed || config.start.seed;
+        const seed = this.options.seed || config.start.seed || seedConfig;
         let categories;
         if (typeof seed === "string") {
             categories = seed.split(",");
@@ -200,10 +263,25 @@ class ServerlessDynamodbLocal {
             if (migration.StreamSpecification && migration.StreamSpecification.StreamViewType) {
                 migration.StreamSpecification.StreamEnabled = true;
             }
+            if (migration.TimeToLiveSpecification) {
+              delete migration.TimeToLiveSpecification;
+            }
+            if (migration.SSESpecification) {
+              migration.SSESpecification.Enabled = migration.SSESpecification.SSEEnabled;
+              delete migration.SSESpecification.SSEEnabled;
+            }
+            if (migration.Tags) {
+                delete migration.Tags;
+            }
             dynamodb.raw.createTable(migration, (err) => {
                 if (err) {
-                    this.serverlessLog("DynamoDB - Error - ", err);
-                    reject(err);
+                    if (err.name === 'ResourceInUseException') {
+                        this.serverlessLog(`DynamoDB - Warn - table ${migration.TableName} already exists`);
+                        resolve();
+                    } else {
+                        this.serverlessLog("DynamoDB - Error - ", err);
+                        reject(err);
+                    }
                 } else {
                     this.serverlessLog("DynamoDB - created table " + migration.TableName);
                     resolve(migration);
